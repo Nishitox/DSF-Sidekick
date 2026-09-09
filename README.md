@@ -1,83 +1,151 @@
 # DSF Framelet
 
-DSF（Dynamic Storage Frame / 動的ストレージフレーム）は、Minecraft functionにおいて、functionの呼び出しごとに一意なstorage領域を動的に確保し、その参照ID（handle）をmacro引数として受け渡すことで、疑似的なローカル変数環境を実現するための、ミニマムなランタイム機構およびコード設計パターンです。
+DSF Framelet は、Minecraft のコマンド構文を維持したまま、`.mcfunction` を可能な限り通常のプログラミング言語に近い構造で記述することを目的とした Datapack ランタイムおよびコード設計です。
 
-これにより、schedule等によってtickをまたぐことなく、1 tick内で完結する「初期化・ループ・完了」の一連の処理を、単一のfunction内に記述しつつ、再帰呼び出しやネストした呼び出しに対しても状態衝突を起こさない、再入可能な実装が可能になります。
-この仕組みを利用したfunctionを「**frame関数**」と呼びます。
+中核機構の **DSF（Dynamic Storage Frame / 動的ストレージフレーム）** は、frame関数を新しい処理として起動するごとに一意な storage 上の frame を動的に確保し、その参照となる **handle（参照ID）** を macro 引数として伝播させます。
 
-handleはframeへの参照として機能するため、補助functionはhandleを介して、呼び出し元のframe内データへアクセスできます。これにより、共通処理をfunctionとして外部へ切り出した場合でも、同じframe内データを共有でき、疑似的な参照渡しが可能になります。
+DSF により、次の構造を Minecraft function 上で実現します。
 
-この仕組みによって、Minecraftのグローバルなstorage上で明示的なライフサイクルを持つ「疑似的なローカル状態管理」を扱えるようになります。
+- frame関数の新規起動ごとに独立した疑似ローカル状態
+- 同じ frame関数を独立した処理として再起動・ネスト起動した場合の再入可能性
+- handle を介した補助 function への疑似参照渡し
+- Entity を実行状態のコンテナとして使用しない状態管理
+- tick 境界を挟まず、呼び出した tick 内で完了する基本フロー
+- 処理固有の「初期化・ループ・終了」を1つの frame関数にまとめる構造
 
----
+Framelet は独自言語や外部コンパイラによって Minecraft コマンドを置き換えるものではありません。Minecraft コマンド、function macro、storage、`return` などの既存仕様を組み合わせ、その上に呼び出し単位の実行状態と制御構造を構成します。
 
-### 対象バージョン
+## DSF による状態分離
 
-* `Minecraft 26.1.2`を前提に作成しています。それ以前のバージョンでの動作は未確認のため、正常に動作しない可能性があります。
+固定された scoreboard や storage を function の状態変数として使用すると、その状態は複数の呼び出しから共有されます。
 
-### 導入方法
+```text
+call A ─┐
+        ├─> shared state
+call B ─┘
+```
 
-1. [DSF-Framelet-main.zip](https://github.com/Nishitox/DSF-Framelet/archive/refs/heads/main.zip)をダウンロードします
-2. ダウンロードしたzipファイルの中身を`<使用するワールド>/datapacks/DSF-Framelet-main/pack.mcmeta`となるように配置してください
-3. 使用するワールド上で`/function dsf:init`を実行してください
+同じ function を再帰的・ネストして呼び出した場合、内側の呼び出しが外側の状態を上書きする可能性があります。
 
----
+DSF では、`issue_with_run` 等によって frame関数を新しい処理として起動するごとに異なる handle を発行し、handle ごとに frame を分離します。
 
-### サンプルコード
+```text
+call A ── handle 12 ──> frame 12
+call B ── handle 13 ──> frame 13
+call C ── handle 14 ──> frame 14
+```
 
-以下の関数をサンプルとして利用できます。
+frame は storage 上の状態領域です。同じ frame関数を複数の独立した処理として起動した場合、それぞれの起動は異なる handle と frame を持ちます。
 
-- `dsfsample:sample`: サンプル用関数。配列を作成し、ループ処理を行います  
-  例：`/function dsf:frame/handle/issue_with_run {path:"dsfsample:sample", arg:{route: "init", elem:0}}`
+## 実引数と仮引数に相当する領域
 
-- `dsf:frame/format`: 解放されず残留したdsf:frameストレージを一括解放する関数  
-  例：`/function dsf:frame/handle/issue_with_run {path:"dsf:frame/format", arg:{route: "init", elem:0}}`
+各 frame は主に `arg` と `prm` の2領域を持ちます。
 
-### frame関数の作成方法
+- `arg (argument)`: 呼び出し側が次の function 呼び出しへ渡す値を構成する領域で、実引数に相当します。
+- `prm (parameter)`: 受け側が必要な値を格納・判定する領域で、仮引数に相当します。処理中に保持する list などの作業用データも原則として `prm` に格納します。
 
-`dsfsample:template`をコピーして作成します。
+Minecraft function 自体に一般的なプログラミング言語の仮引数宣言が追加されるわけではありませんが、Framelet の呼び出し規約として、呼び出し側の実引数と受け側の仮引数に相当する役割を分離しています。
 
-- `任意処理`とコメントのあるコマンドの箇所に、処理したい内容を記述します。
-- `固定処理`とコメントのあるコマンドは制御に必要なコマンドです。削除や実行順の変更はできません。
+## 1 process = 1 frame function
 
----
+Minecraft には複数行を直接まとめるコードブロック構文がないため、一連の複数行を再実行・分岐させる場合、通常は処理固有のコードを複数の function に分割して記述することになります。
 
-### 変数の構成
+Framelet は、handle の発行、route 遷移、list の next、release などを共通ランタイムとして提供し、処理固有の次の要素を1つの frame関数に残します。
 
-各frameは主に以下の2領域を持ちます
-1. `arg(argument)`: frame関数を呼び出す際に渡す実引数として利用される領域です。`path`,`handle`,`route`,`elem`などの引数が入ります。
+```text
+init
+  ↓
+loop
+  ↓
+done
+```
 
-2. `prm(parameter)`: 渡された引数を格納する仮引数として利用される領域です。そのほかにlist等のframe関数内で利用する作業用のデータは原則としてprmに格納します。
+「1 function」は、Framelet の内部ランタイムまで1ファイルだけで構成するという意味ではありません。新しい処理を追加するとき、追加する処理固有の function を原則1つにできることを意味します。
 
-### 主要な引数の説明及び記述順のルール
+```text
+Framelet 共通ランタイム
+  ├─ issue
+  ├─ issue_with_run
+  ├─ goto_root
+  ├─ goto_next
+  ├─ list/next
+  └─ release
+        ↑ 全frame関数で共用
 
-引数や処理において、順番が処理結果に影響しない場合、引数の並び順は原則として以下の順序に統一します。
+処理A → process_a.mcfunction
+処理B → process_b.mcfunction
+処理C → process_c.mcfunction
+```
 
-1. `path`: 実行対象の関数（dsfsample:sample）
-2. `handle`: 操作対象となるframeを指す番号
-3. `route`: frame関数内で通る実行経路（init/root/branch）
-4. `elem`: frame関数内で使用する現在の配列要素
+処理を追加するたびに init / loop / next / done 用の function 群を追加するのではなく、共通制御をランタイム側へ集約することで、追加ファイル数を最小限に保ちます。
 
-例：`/function dsfsample:sample {path:"dsfsample:sample", handle:1, route:"root", elem:""}`
+## handle の発行と `issue_with_run`
 
----
+frame を新規に使用するには、active な frame と衝突しない handle を確保する必要があります。
 
-### format 関数
+`dsf:frame/handle/issue` は、循環する cursor と `used` の状態から未使用の handle を探索・予約し、その handle を返します。
 
-`dsf:frame/format`は、`dsf:handle cache`を元に、使用された痕跡のあるframe領域を強制的に削除する関数です。原則としてframe関数は正常終了時に対象のframeを解放する設計になっていますが、異常終了などでframeが正常に解放されずに残留した場合にすべてのframeを一括で削除するための機能です。**使用中のframeであっても強制的に解放されるため、デバッグや初期化での使用を想定しています。**
+`issue` のみを利用する場合、呼び出し側では次の処理が必要です。
 
----
+```text
+handleを発行
+↓
+初期引数にhandleを追加
+↓
+frame関数を実行
+```
 
-### issue_with_run 関数
+`dsf:frame/handle/issue_with_run` は、この起動手続きを1回の function 呼び出しに統合します。
 
-`dsf:frame/handle/issue_with_run`は、新しいframe用のhandleを発行し、指定された初期引数にそのhandleを追加して、対象のframe関数を実行するための補助関数です。
+```mcfunction
+/function dsf:frame/handle/issue_with_run {path:"dsfsample:sample", arg:{route:"init", elem:0}}
+```
 
-通常、frame関数を開始するには、先にhandleを発行し、そのhandleと初期引数を組み合わせてframe関数を呼び出す必要があります。`issue_with_run`関数はこの手続きをまとめて行い、開発者がhandle発行処理を個別に記述せずにframe関数を開始できるようにします。
+`issue_with_run` は handle を発行し、初期引数と handle を call buffer に構成したうえで、対象の frame関数を実行します。これにより、handle の確保処理を各 frame関数の呼び出し側へ記述する必要がなくなり、frame関数の起動方法を共通化できます。
 
----
+## 対象バージョン
 
-### dsf:frame call ストレージ領域
+- Minecraft `26.2` を前提に作成しています。
+- それ以前のバージョンでの動作は未確認です。対象バージョンの詳細は`pack.mcmeta`を参照してください。
 
-`dsf:frame call`は、`issue_with_run`が発行したhandleと渡された初期引数を組み立てるために使用するグローバルな一時storage領域です。
+## 導入
 
-`call` は状態保存用ではなく、呼び出し直前の短命なバッファとしてのみ使用します。呼び出し先の関数は、受け取った値を自身のframeにコピーして扱うため、`call`が後続の呼び出しで上書きされても、既存frame の状態には影響しません。
+1. リポジトリをダウンロードします。
+2. `pack.mcmeta` が `<world>/datapacks/DSF-Framelet-main/pack.mcmeta` となるように配置します。
+3. ワールド上で次を実行します。
+
+```mcfunction
+/function dsf:init
+```
+
+## サンプル
+
+### `dsfsample:sample`
+
+配列 `[1,2,3,4,5,6]` を作成し、同一 tick 内で順番に処理した後、終了処理を行う frame関数です。
+
+```mcfunction
+/function dsf:frame/handle/issue_with_run {path:"dsfsample:sample", arg:{route:"init", elem:0}}
+```
+
+frame関数を新規作成する場合は `dsfsample:template` をコピーして利用してください。
+
+## ドキュメント
+
+- [Framelet の設計背景](docs/CONCEPT.md)
+- [frame関数の作成・利用方法](docs/USAGE.md)
+- [DSF内部構造：handle / issue / route / release](docs/INTERNALS.md)
+
+## 用語
+
+| 用語 | 意味 |
+| --- | --- |
+| Framelet | 本 Datapack、および Minecraft commands をよりプログラミング言語的な記述へ近づけるための設計 |
+| DSF | Dynamic Storage Frame。frame関数の新規起動ごとの局所状態を構成する中核機構 |
+| frame | handle ごとに `dsf:frame` storage 上へ確保される、呼び出し固有の実行状態 |
+| handle | frame を識別・参照する整数 参照ID |
+| frame関数 | DSF の frame を利用し、`init / root / branch / done` の規約に従う function |
+| `arg` | 次の function 呼び出しへ渡す実引数領域 |
+| `prm` | 受け取った値や作業用データを保持する仮引数・ローカル状態領域 |
+| `route` | frame関数内の実行経路。`init` / `root` / `branch` |
+| release | frame と handle の使用状態を解放する処理 |
